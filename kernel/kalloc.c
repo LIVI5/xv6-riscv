@@ -80,3 +80,18 @@ kalloc(void)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
 }
+
+int
+freelist_count (void) 
+{ // freelist를 순회하면서 사이즈를 구함
+  int fl_cnt = 0;
+  struct run *r = kmem.freelist;
+  
+  acquire(&kmem.lock);
+  while(r!=0) {
+    fl_cnt++;
+    r = r->next;
+  }
+  release(&kmem.lock);
+  return fl_cnt;
+}

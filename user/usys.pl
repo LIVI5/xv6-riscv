@@ -36,3 +36,7 @@ entry("getpid");
 entry("sbrk");
 entry("sleep");
 entry("uptime");
+# addition
+entry("mmap");
+entry("munmap");
+entry("freemem");

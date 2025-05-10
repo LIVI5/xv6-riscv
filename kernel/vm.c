@@ -5,6 +5,9 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "proc.h"
+#include "file.h"
+#include "mmap.h"
 
 /*
  * the kernel's page table.
@@ -82,6 +85,8 @@ kvminithart()
 //   21..29 -- 9 bits of level-1 index.
 //   12..20 -- 9 bits of level-0 index.
 //    0..11 -- 12 bits of byte offset within the page.
+// PTE 찾거나 생성할 때 사용
+// alloc == 1 이면 중간 페이지테이블 생성
 pte_t *
 walk(pagetable_t pagetable, uint64 va, int alloc)
 {
@@ -91,14 +96,18 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
   for(int level = 2; level > 0; level--) {
     pte_t *pte = &pagetable[PX(level, va)];
     if(*pte & PTE_V) {
+      // 유효한 PTE라면 다음 pt 접근을 위한 pa를 추출
       pagetable = (pagetable_t)PTE2PA(*pte);
     } else {
       if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
+      // alloc == 0 이라면 바로 리턴. 1이라면 새 pt 할당, 실패하면 리턴.
         return 0;
       memset(pagetable, 0, PGSIZE);
+      // 새로 만든 pt의 pa를 PTE로 설정. valid 설정.
       *pte = PA2PTE(pagetable) | PTE_V;
     }
   }
+  // 해당 PTE가 속하는 L0 페이지테이블의 시작주소 반환환
   return &pagetable[PX(0, va)];
 }
 
@@ -140,6 +149,7 @@ kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
 // va and size MUST be page-aligned.
 // Returns 0 on success, -1 if walk() couldn't
 // allocate a needed page-table page.
+// va -> pa 로 매핑
 int
 mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
 {
@@ -158,11 +168,13 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   a = va;
   last = va + size - PGSIZE;
   for(;;){
+    // 현재 페이지의 pte찾기
     if((pte = walk(pagetable, a, 1)) == 0)
       return -1;
     if(*pte & PTE_V)
       panic("mappages: remap");
-    *pte = PA2PTE(pa) | perm | PTE_V;
+    // 해당 pte에 pa 저장. vailid bit 설정
+    *pte = PxA2PTE(pa) | perm | PTE_V;
     if(a == last)
       break;
     a += PGSIZE;
@@ -218,7 +230,6 @@ void
 uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
 {
   char *mem;
-
   if(sz >= PGSIZE)
     panic("uvmfirst: more than a page");
   mem = kalloc();
@@ -229,6 +240,7 @@ uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
 
 // Allocate PTEs and physical memory to grow process from oldsz to
 // newsz, which need not be page aligned.  Returns new size or 0 on error.
+// user 레벨에서 heap 공간 할당할때 사용용
 uint64
 uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
 {
@@ -259,6 +271,7 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
 // newsz.  oldsz and newsz need not be page-aligned, nor does newsz
 // need to be less than oldsz.  oldsz can be larger than the actual
 // process size.  Returns the new process size.
+// heap 공간 해제
 uint64
 uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
 {
@@ -448,4 +461,122 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+// addition
+uint64
+mmap(uint64 addr, int length, int prot, int flags, int fd, int offset) 
+{
+  struct proc *p = myproc();
+  struct file *f = 0;
+  uint64 va = MMAPBASE + addr;
+  char* mem;
+
+  int perm = 0;
+  if (prot & PROT_READ)
+    perm = PTE_U | PTE_R;
+  if (prot & PROT_WRITE)
+    perm = PTE_U | PTE_W;
+
+  if (flags & MAP_ANONYMOUS) {
+    if (fd != -1) // anonymous 라면 fd == -1
+      return 0;
+
+    if (flags & MAP_POPULATE) { // 바로 물리메모리 할당
+      for(int a = 0; a < length; a += PGSIZE) {
+        mem = kalloc();
+        if(mem == 0) // 남은 메모리가 없는 경우
+          return 0;
+          
+        memset(mem, 0, PGSIZE); // ANO. 경우 이므로 0으로 채움
+        if (mappages(p->pagetable, va, PGSIZE, (uint64)mem, perm) != 0)
+          return 0; // 매핑이 제대로 되지 않은 경우
+      }
+    }
+  }
+  else { // 파일을 매핑하는경우
+    if (fd < 0 || fd >= NOFILE)
+        return 0;
+    f = p->ofile[fd];
+    int r = 0;
+
+    if ((prot&PROT_READ) && !f->readable)
+      return 0;
+    if ((prot & PROT_WRITE) && !f->writable)
+      return 0;
+    
+    if (flags & MAP_POPULATE) { // 바로 물리메모리 할당
+      for(int a = 0; a < length; a += PGSIZE) {
+        mem = kalloc();
+        if(mem == 0) // 남은 메모리가 없는 경우
+          return 0;
+
+        ilock(f->ip);
+        if((r = readi(f->ip, 0, (uint64)mem, offset + a, PGSIZE)) < 0) // readi() : 파일의 offset 에서 부터 커널공간(user_dst=0)에 로드. 실패시 -1 리턴.
+          return 0; // 파일 로드가 실패한 경우
+        iunlock(f->ip);
+
+        if (mappages(p->pagetable, va, PGSIZE, (uint64)mem, perm) != 0)
+          return 0; // 매핑이 제대로 되지 않은 경우
+      }
+    }
+  } 
+  
+  struct mmap_area *ma = 0;
+  for (int i = 0; i < 64; i++) {
+    if (mmap_area_Arr[i].length == 0) {
+      ma = &mmap_area_Arr[i];
+      break;
+    }
+  }
+  if (ma == 0) // mmap_area_Array에 자리가 없는 경우
+  return 0; 
+  
+  ma->f = f;
+  ma->addr = addr;
+  ma->length = length;
+  ma->offset = offset;
+  ma->prot = prot;
+  ma->flags = flags;
+  ma->p = p;
+
+  return va;
+}
+
+int
+munmap(uint64 addr) 
+{
+  struct proc *p = myproc();
+  // mmap_area 제거
+  struct mmap_area *ma = 0;
+  for (int i = 0; i < 64; i++) {
+    if ((p == mmap_area_Arr[i].p) && 
+        addr >= mmap_area_Arr[i].addr &&
+        addr < mmap_area_Arr[i].addr + mmap_area_Arr[i].length) {
+      ma = &mmap_area_Arr[i];
+      break;
+    }
+  }
+  if (ma == 0) // mmap_area가 없는 경우
+    return -1; 
+
+  // phy. page & page table 해제
+  uvmunmap(p->pagetable, addr+MMAPBASE, ma->length/PGSIZE, 1);
+
+  ma->f = 0;
+  ma->addr = 0;
+  ma->length = 0;
+  ma->offset = 0;
+  ma->prot = 0;
+  ma->flags = 0;
+  ma->p = 0;
+
+  return 1;
+}
+
+int
+freemem(void) 
+{
+  int free_page = freelist_count();
+  return free_page;
 }

@@ -5,11 +5,14 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "mmap.h"
 
 struct spinlock tickslock;
 uint ticks;
 
 extern char trampoline[], uservec[], userret[];
+
+extern struct mmap_area mmap_area_Arr[64];
 
 // in kernelvec.S, calls kerneltrap().
 void kernelvec();
@@ -66,7 +69,64 @@ usertrap(void)
 
     syscall();
   } else if((which_dev = devintr()) != 0){
-    // ok
+    // page fault handler
+    // MAP_POPULATE == 0 인 경우에만 호출됨
+  } else if (r_scause() == 13 || r_scause() == 15) {
+    // read : 13, write : 15
+    uint64 va = r_stval();
+    struct proc *p = myproc();
+
+    struct mmap_area *ma = 0;
+    for (int i = 0; i < 64; i++) {
+      if ((p == mmap_area_Arr[i].p) && 
+          va >= mmap_area_Arr[i].addr + MMAPBASE &&
+          va < mmap_area_Arr[i].addr + MMAPBASE + mmap_area_Arr[i].length) {
+        ma = &mmap_area_Arr[i];
+        break;
+      }
+    }
+    if (ma == 0) // 맞는 mmap_area 가 없는 경우우
+    return -1; 
+
+    if ((ma->prot != PROT_WRITE) && (r_scause() == 15))
+    // write가 허용되지 않은 페이지에 write를 시도한 경우
+      return -1;
+
+    uint64 addr = ma->addr;
+    int length = ma->length;
+    int prot = ma->prot;
+    int flags = ma->flags;
+    struct file *f = ma->f;
+    int offset = ma->offset;
+
+    char *mem;
+    int r = 0;
+    int perm = 0;
+
+    if (prot & PROT_READ)
+      perm = PTE_U | PTE_R;
+    if (prot & PROT_WRITE)
+      perm = PTE_U | PTE_W;
+
+    for(int a = 0; a < length; a += PGSIZE) {
+      mem = kalloc();
+      if(mem == 0) // 남은 메모리가 없는 경우
+        return -1;
+        memset(mem, 0, PGSIZE);
+
+      if (flags & MAP_ANONYMOUS) { // 0으로 채운 페이지 그대로 매핑
+            if (mappages(p->pagetable, va, PGSIZE, (uint64)mem, perm) != 0)
+              return -1; // 매핑이 제대로 되지 않은 경우
+      } else { // file mapping
+        ilock(f->ip);
+        if((r = readi(f->ip, 0, (uint64)mem, offset + a, PGSIZE)) < 0)
+          return -1; // 파일 로드가 실패한 경우
+        iunlock(f->ip);
+        
+        if (mappages(p->pagetable, va, PGSIZE, (uint64)mem, perm) != 0)
+          return -1; // 매핑이 제대로 되지 않은 경우
+      }
+    }
   } else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
     printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
